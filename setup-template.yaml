@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Build template for Dev and Staging projects
+
+Parameters:
+  ServiceName:
+    Description: Enter a lower case, high level service name without environment details. Used to autofill service names. For example, my-service-name
+    Type: String
+    Default: "{SERVICE}"
+  GitRepo:
+    Description: Source uri of git repo to clone, for example https://github.com/gridsmartercities/python-serverless-template.git
+    Type: String
+    Default: "{REPO}"
+  AlertEmail:
+    Description: Email address to send staging build alerts to, or example you@example.com
+    Type: String
+    Default: "{EMAIL}"
+
+Resources:
+  SamS3BucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}/build/SAM_S3_BUCKET
+      Type: String
+      Value: !Sub ${ServiceName}-output-stg
+  CodebuildOutputS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ServiceName}-output-stg
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  CodebuildFailedBuildEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ServiceName}-build-event-rule
+      Description: Fire an event when a staging build fails
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - Codebuild Build State Change
+        detail:
+          build-status:
+            - FAILED
+          project-name:
+            - !Ref CodebuildStgProject
+      Targets:
+        - Arn: !Ref CodebuildAlarmTopic
+          Id: !Sub ${ServiceName}-build-event-rule-target
+  CodebuildAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub codebuild-${ServiceName}-alarms
+      Subscription:
+        - Endpoint: !Sub ${AlertEmail}
+          Protocol: email
+  CodebuildDevProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ServiceName}-dev
+      ServiceRole: !GetAtt CodebuildDevRole.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:1.0
+      Source:
+        Auth:
+          Type: OAUTH
+        Location: !Sub ${GitRepo}
+        Type: GITHUB
+        BuildSpec: buildspec-dev.yaml
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED
+      TimeoutInMinutes: 10
+  CodebuildStgProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ServiceName}-stg
+      ServiceRole: !GetAtt CodebuildStgRole.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:1.0
+      Source:
+        Auth:
+          Type: OAUTH
+        Location: !Sub ${GitRepo}
+        Type: GITHUB
+        BuildSpec: buildspec-stg.yaml
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PUSH
+            - Type: HEAD_REF
+              Pattern: ^refs/heads/master$
+      TimeoutInMinutes: 10
+  CodeBuildSharedPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub codebuild-${ServiceName}-shared-service-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: ssm:GetParameters
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/build/SAM_S3_BUCKET
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::${ServiceName}-output-stg/*
+          - Effect: Allow
+            Action: ssm:GetParameters
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PassRole
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:DeleteFunction
+              - lambda:AddPermission
+              - lambda:UpdateFunctionCode
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - apigateway:PUT
+              - apigateway:POST
+              - apigateway:PATCH
+              - apigateway:DELETE
+              - apigateway:GET
+            Resource: !Sub arn:aws:apigateway:${AWS::Region}::/restapis*
+          - Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - cloudformation:CreateChangeSet
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListStacks
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DescribeChangeSet
+            Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+            Resource: "*"
+      Roles:
+        - !Ref CodebuildDevRole
+        - !Ref CodebuildStgRole
+  CodebuildStgPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub codebuild-${ServiceName}-stg-service-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:DeleteStack
+            Resource: "*"
+      Roles:
+        - !Ref CodebuildStgRole
+  CodebuildDevRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub codebuild-${ServiceName}-dev-service-role
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action:
+                - sts:AssumeRole
+  CodebuildStgRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub codebuild-${ServiceName}-stg-service-role
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action:
+                - sts:AssumeRole
